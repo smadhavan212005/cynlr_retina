@@ -1,0 +1,164 @@
+:root {
+  --bg: #ffffff;
+  --panel: #fafafa;
+  --border: #ccc;
+  --text: #222;
+  --muted: #666;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1c1c1c;
+    --panel: #262626;
+    --border: #444;
+    --text: #ddd;
+    --muted: #999;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: Arial, Helvetica, sans-serif;
+  margin: 0;
+  padding: 16px 20px;
+}
+
+h1 {
+  font-size: 1.3rem;
+  font-weight: bold;
+  margin: 0 0 4px;
+}
+
+p.subtitle {
+  color: var(--muted);
+  font-size: 0.85rem;
+  margin: 0 0 14px;
+}
+
+main {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.views {
+  display: flex;
+  gap: 12px;
+  flex: 3;
+  min-width: 300px;
+  flex-wrap: wrap;
+}
+
+.view-panel {
+  flex: 1;
+  min-width: 260px;
+}
+
+.view-panel h2 {
+  font-size: 0.9rem;
+  font-weight: bold;
+  margin: 0 0 4px;
+}
+
+.view-panel .frame {
+  background: #000;
+  border: 1px solid var(--border);
+}
+
+.view-panel video,
+.view-panel canvas {
+  width: 100%;
+  display: block;
+}
+
+.controls {
+  flex: 1;
+  min-width: 220px;
+  max-width: 280px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  padding: 12px 14px;
+}
+
+.control {
+  margin-bottom: 14px;
+}
+
+.control label {
+  display: block;
+  font-size: 0.85rem;
+  margin-bottom: 2px;
+}
+
+.control .value {
+  color: var(--muted);
+}
+
+.control input[type="range"] {
+  width: 100%;
+}
+
+.control .hint {
+  font-size: 0.72rem;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.buttons {
+  margin: 10px 0;
+}
+
+button {
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 0.9rem;
+  margin-right: 6px;
+}
+
+button:hover:not(:disabled) {
+  background: var(--border);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.status {
+  font-size: 0.8rem;
+  color: var(--muted);
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+  margin-top: 10px;
+}
+
+.status .fps {
+  font-size: 1.4rem;
+  font-weight: bold;
+  color: var(--text);
+}
+
+.legend {
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin: 6px 0 0;
+}
+
+@media (max-width: 700px) {
+  main {
+    flex-direction: column;
+  }
+  .controls {
+    max-width: none;
+    width: 100%;
+  }
+}

@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Cynlr-PS</title>
+<link rel="stylesheet" href="live_feed/style.css" />
+</head>
+<body>
+<h1>Retinal OPL Live Feed</h1>
+
+<main>
+  <div class="views">
+    <div class="view-panel">
+      <h2>Camera</h2>
+      <div class="frame">
+        <video id="video" autoplay playsinline muted></video>
+      </div>
+    </div>
+    <div class="view-panel">
+      <h2>OPL Composite</h2>
+      <div class="frame">
+        <canvas id="output-canvas"></canvas>
+      </div>
+      <p class="legend">Blue = ON edges, Red = OFF edges</p>
+    </div>
+  </div>
+
+  <div class="controls">
+    <div class="control">
+      <label>Tau (photoreceptor time constant) <span class="value" id="tau-value">0.05 s</span></label>
+      <input type="range" id="tau-slider" min="0.02" max="0.20" step="0.005" value="0.05" />
+      <div class="hint">Low = photopic / fast tracking. High = scotopic / heavy smoothing.</div>
+    </div>
+    <div class="control">
+      <label>Gain <span class="value" id="gain-value">0.00</span></label>
+      <input type="range" id="gain-slider" min="0" max="1" step="0.01" value="0" />
+      <div class="hint" id="gain-hint">Drives surround sigma (or hardware exposure/gain if supported).</div>
+    </div>
+    <div class="control">
+      <label>Focus / defocus <span class="value" id="focus-value">0.00</span></label>
+      <input type="range" id="focus-slider" min="0" max="1" step="0.01" value="0" />
+      <div class="hint" id="focus-hint">Drives centre sigma (or hardware focus distance if supported).</div>
+    </div>
+
+    <div class="buttons">
+      <button id="start-btn">Start</button>
+      <button id="stop-btn" disabled>Stop</button>
+    </div>
+
+    <div class="status">
+      <div>sigma_c: <span id="sigma-c-value">1.50</span> &nbsp; sigma_s: <span id="sigma-s-value">6.00</span></div>
+      <div>FPS</div>
+      <div class="fps" id="fps-value">--</div>
+    </div>
+  </div>
+</main>
+
+<script>
+  // runs synchronously before the async opencv.js script can finish loading,
+  // so cv['onRuntimeInitialized'] is always attached before wasm init completes
+  function onOpenCvReady() {
+    cv['onRuntimeInitialized'] = () => {
+      window.dispatchEvent(new Event('opencv-ready'));
+    };
+  }
+</script>
+<script async src="https://docs.opencv.org/4.x/opencv.js" onload="onOpenCvReady()"></script>
+<script type="module">
+import {
+  oplPipelineV2Core,
+  TemporalBlender,
+  FPSMeter,
+  exposureToAlpha,
+  computeSigmas,
+  scotopicTau,
+  getTrackCapabilities,
+  applyNormalisedConstraint,
+} from './live_feed/opl_engine.js';
+
+const video = document.getElementById('video');
+const canvas = document.getElementById('output-canvas');
+const startBtn = document.getElementById('start-btn');
+const stopBtn = document.getElementById('stop-btn');
+
+const tauSlider = document.getElementById('tau-slider');
+const gainSlider = document.getElementById('gain-slider');
+const focusSlider = document.getElementById('focus-slider');
+const tauValue = document.getElementById('tau-value');
+const gainValue = document.getElementById('gain-value');
+const focusValue = document.getElementById('focus-value');
+const gainHint = document.getElementById('gain-hint');
+const focusHint = document.getElementById('focus-hint');
+const sigmaCValue = document.getElementById('sigma-c-value');
+const sigmaSValue = document.getElementById('sigma-s-value');
+const fpsValue = document.getElementById('fps-value');
+
+let cvReady = false;
+let running = false;
+let stream = null;
+let track = null;
+let hardwareGainCap = null;
+let hardwareFocusCap = null;
+
+const blender = new TemporalBlender();
+const fpsMeter = new FPSMeter(30);
+let prevTime = null;
+
+// reused across frames to avoid per-frame canvas/element allocation
+const captureCanvas = document.createElement('canvas');
+const captureCtx = captureCanvas.getContext('2d', { willReadFrequently: true });
+
+window.addEventListener('opencv-ready', () => {
+  cvReady = true;
+  startBtn.disabled = false;
+});
+startBtn.disabled = true;
+
+function updateSliderLabels() {
+  tauValue.textContent = `${parseFloat(tauSlider.value).toFixed(3)} s`;
+  gainValue.textContent = parseFloat(gainSlider.value).toFixed(2);
+  focusValue.textContent = parseFloat(focusSlider.value).toFixed(2);
+}
+[tauSlider, gainSlider, focusSlider].forEach((el) => el.addEventListener('input', () => {
+  updateSliderLabels();
+  onGainOrFocusChanged();
+}));
+updateSliderLabels();
+
+async function onGainOrFocusChanged() {
+  const gain = parseFloat(gainSlider.value);
+  const focus = parseFloat(focusSlider.value);
+
+  if (hardwareGainCap) {
+    await applyNormalisedConstraint(track, hardwareGainCap, gain);
+  }
+  if (hardwareFocusCap) {
+    await applyNormalisedConstraint(track, hardwareFocusCap, focus);
+  }
+}
+
+function currentSigmas() {
+  // software surrogate only applies for the parameter whose hardware control is unavailable
+  const gain = hardwareGainCap ? 0 : parseFloat(gainSlider.value);
+  const focus = hardwareFocusCap ? 0 : parseFloat(focusSlider.value);
+  return computeSigmas(gain, focus);
+}
+
+function detectHardwareCapabilities() {
+  const caps = getTrackCapabilities(track);
+  hardwareGainCap = null;
+  hardwareFocusCap = null;
+  if (caps) {
+    if ('exposureTime' in caps) hardwareGainCap = 'exposureTime';
+    else if ('exposureCompensation' in caps) hardwareGainCap = 'exposureCompensation';
+    if ('focusDistance' in caps) hardwareFocusCap = 'focusDistance';
+  }
+  gainHint.textContent = hardwareGainCap
+    ? `Driving real hardware (${hardwareGainCap}).`
+    : 'No hardware exposure control — driving surround sigma directly.';
+  focusHint.textContent = hardwareFocusCap
+    ? `Driving real hardware (${hardwareFocusCap}).`
+    : 'No hardware focus control — driving centre sigma directly.';
+}
+
+async function start() {
+  if (!cvReady || running) return;
+  stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
+  video.srcObject = stream;
+  await video.play();
+
+  track = stream.getVideoTracks()[0];
+  detectHardwareCapabilities();
+  await onGainOrFocusChanged();
+
+  canvas.width = video.videoWidth || 640;
+  canvas.height = video.videoHeight || 480;
+
+  running = true;
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
+  prevTime = null;
+  requestAnimationFrame(processFrame);
+}
+
+function stop() {
+  running = false;
+  if (stream) {
+    stream.getTracks().forEach((t) => t.stop());
+    stream = null;
+    track = null;
+  }
+  blender.delete();
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  fpsValue.textContent = '--';
+}
+
+function processFrame() {
+  if (!running) return;
+  const now = performance.now();
+
+  // named so a thrown exception mid-pipeline still lets the finally block
+  // free whatever was allocated and reschedule the loop, instead of an
+  // uncaught error silently killing requestAnimationFrame forever
+  let cap = null, frameBgr = null, composite = null, blended = null, displayRgba = null;
+  try {
+    if (captureCanvas.width !== video.videoWidth || captureCanvas.height !== video.videoHeight) {
+      captureCanvas.width = video.videoWidth;
+      captureCanvas.height = video.videoHeight;
+    }
+    captureCtx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
+    const imageData = captureCtx.getImageData(0, 0, captureCanvas.width, captureCanvas.height);
+
+    cap = new cv.Mat(video.videoHeight, video.videoWidth, cv.CV_8UC4);
+    cap.data.set(imageData.data);
+
+    frameBgr = new cv.Mat();
+    cv.cvtColor(cap, frameBgr, cv.COLOR_RGBA2BGR);
+
+    const { sigmaC, sigmaS } = currentSigmas();
+    sigmaCValue.textContent = sigmaC.toFixed(2);
+    sigmaSValue.textContent = sigmaS.toFixed(2);
+
+    const stats = {};
+    composite = oplPipelineV2Core(cv, frameBgr, { sigmaC, sigmaS }, stats);
+
+    const tau = scotopicTau(parseFloat(tauSlider.value), stats.meanLuminance);
+    const dt = prevTime === null ? 1 / 30 : (now - prevTime) / 1000;
+    const alpha = exposureToAlpha(dt, tau);
+    prevTime = now;
+
+    blended = blender.update(cv, composite, alpha);
+
+    displayRgba = new cv.Mat();
+    cv.cvtColor(blended, displayRgba, cv.COLOR_BGR2RGBA);
+
+    if (canvas.width !== displayRgba.cols || canvas.height !== displayRgba.rows) {
+      canvas.width = displayRgba.cols;
+      canvas.height = displayRgba.rows;
+    }
+    cv.imshow(canvas, displayRgba);
+
+    const frameTimeSeconds = (performance.now() - now) / 1000;
+    const fps = fpsMeter.tick(frameTimeSeconds);
+    fpsValue.textContent = fps.toFixed(1);
+  } catch (e) {
+    console.error('processFrame error (frame skipped):', e);
+  } finally {
+    [cap, frameBgr, composite, blended, displayRgba].forEach((m) => { if (m) m.delete(); });
+    if (running) requestAnimationFrame(processFrame);
+  }
+}
+
+startBtn.addEventListener('click', () => start().catch((e) => {
+  console.error(e);
+  alert('Could not start camera: ' + e.message);
+}));
+stopBtn.addEventListener('click', stop);
+</script>
+</body>
+</html>

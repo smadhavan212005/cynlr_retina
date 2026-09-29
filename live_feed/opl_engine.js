@@ -4,53 +4,20 @@
 export const SIGMA_C_BASE = 1.5;
 export const SIGMA_S_BASE = 6.0;
 
-export const DIM_MEAN_LUMINANCE_THRESHOLD = 60;
-export const SCOTOPIC_MEAN_LUMINANCE_FLOOR = 20;
-export const ROD_POOLING_SIGMA = 1.2;
-export const TAU_SCOTOPIC_MAX = 0.20;
-export const DOG_NOISE_MAD_MULTIPLIER = 4.0;
-
 export function clamp(v, lo, hi) {
   return Math.max(lo, Math.min(hi, v));
 }
 
-// mean_luminance
-export function meanLuminance(cv, luminance) {
-  return cv.mean(luminance)[0];
-}
-
-// is_dim_frame
-export function isDimFrame(meanLum, threshold = DIM_MEAN_LUMINANCE_THRESHOLD) {
-  return meanLum < threshold;
-}
-
-// dimness_fraction_for_scotopic_taper
-export function dimnessFraction(meanLum, brightThresh = DIM_MEAN_LUMINANCE_THRESHOLD, darkFloor = SCOTOPIC_MEAN_LUMINANCE_FLOOR) {
-  if (meanLum >= brightThresh) return 0;
-  if (meanLum <= darkFloor) return 1;
-  return (brightThresh - meanLum) / (brightThresh - darkFloor);
-}
-
-// scotopic_temporal_integration_tau_taper
-export function scotopicTau(tauBase, meanLum, tauScotopicMax = TAU_SCOTOPIC_MAX) {
-  const frac = dimnessFraction(meanLum);
-  return tauBase + frac * (tauScotopicMax - tauBase);
-}
-
 // rgb_to_luminance
+// same weighted sum as before (0.299R+0.587G+0.114B), fused into one transform
+// call instead of split/convert/addWeighted x2 - identical arithmetic, far fewer WASM calls
 export function rgbToLuminance(cv, srcBgr) {
-  const chans = new cv.MatVector();
-  cv.split(srcBgr, chans);
-  const bChan = chans.get(0), gChan = chans.get(1), rChan = chans.get(2);
-  const bf = new cv.Mat(), gf = new cv.Mat(), rf = new cv.Mat();
-  bChan.convertTo(bf, cv.CV_32F);
-  gChan.convertTo(gf, cv.CV_32F);
-  rChan.convertTo(rf, cv.CV_32F);
+  const srcF = new cv.Mat();
+  srcBgr.convertTo(srcF, cv.CV_32FC3);
+  const weights = cv.matFromArray(1, 3, cv.CV_32FC1, [0.114, 0.587, 0.299]); // B,G,R order
   const luminance = new cv.Mat();
-  cv.addWeighted(rf, 0.299, gf, 0.587, 0, luminance);
-  cv.addWeighted(luminance, 1, bf, 0.114, 0, luminance);
-  bChan.delete(); gChan.delete(); rChan.delete();
-  chans.delete(); bf.delete(); gf.delete(); rf.delete();
+  cv.transform(srcF, luminance, weights);
+  srcF.delete(); weights.delete();
   return luminance;
 }
 
@@ -75,24 +42,6 @@ export function logTransform(cv, luminance, c = null) {
   return result;
 }
 
-// rod_convergence_pooling
-export function rodPooling(cv, luminance) {
-  return gaussianBlur(cv, luminance, ROD_POOLING_SIGMA);
-}
-
-// noise_sigma_via_median_absolute_deviation
-export function estimateNoiseSigma(dog) {
-  const data = dog.data32F;
-  const n = data.length;
-  const sorted = Float32Array.from(data).sort();
-  const median = n % 2 === 0 ? (sorted[n / 2 - 1] + sorted[n / 2]) / 2 : sorted[(n - 1) / 2];
-  const absDev = new Float32Array(n);
-  for (let i = 0; i < n; i++) absDev[i] = Math.abs(data[i] - median);
-  absDev.sort();
-  const mad = n % 2 === 0 ? (absDev[n / 2 - 1] + absDev[n / 2]) / 2 : absDev[(n - 1) / 2];
-  return 1.4826 * mad;
-}
-
 // kernel_size_from_sigma + apply_gaussian_blur
 export function gaussianBlur(cv, image, sigma) {
   const ksize = Math.floor(2 * Math.ceil(3 * sigma) + 1);
@@ -112,22 +61,21 @@ export function differenceOfGaussians(cv, image, sigmaC, sigmaS) {
 }
 
 // half_wave_rectify_positive
+// max(dog,0) via THRESH_TOZERO - same result as a zero-mat + cv.max, one fewer full-res allocation
 export function rectifyOn(cv, dog) {
-  const zero = new cv.Mat(dog.rows, dog.cols, dog.type(), new cv.Scalar(0));
   const out = new cv.Mat();
-  cv.max(dog, zero, out);
-  zero.delete();
+  cv.threshold(dog, out, 0, 0, cv.THRESH_TOZERO);
   return out;
 }
 
 // half_wave_rectify_negative
+// max(-dog,0) via THRESH_TOZERO on the negated dog - same result, one fewer full-res allocation
 export function rectifyOff(cv, dog) {
   const neg = new cv.Mat();
   dog.convertTo(neg, -1, -1, 0);
-  const zero = new cv.Mat(dog.rows, dog.cols, dog.type(), new cv.Scalar(0));
   const out = new cv.Mat();
-  cv.max(neg, zero, out);
-  neg.delete(); zero.delete();
+  cv.threshold(neg, out, 0, 0, cv.THRESH_TOZERO);
+  neg.delete();
   return out;
 }
 
@@ -218,8 +166,7 @@ export function filterByContourArea(cv, dog, dogThreshold = 5.0, minArea = 500) 
 }
 
 // full_v2_pipeline: frameBgr (CV_8UC3) -> composite (CV_8UC3), caller owns and deletes the result
-// outStats, if given, gets meanLuminance/isDim/dogThreshold written to it for the caller (e.g. tau tapering)
-export function oplPipelineV2Core(cv, frameBgr, params = {}, outStats = null) {
+export function oplPipelineV2Core(cv, frameBgr, params = {}) {
   const {
     sigmaC = SIGMA_C_BASE,
     sigmaS = SIGMA_S_BASE,
@@ -231,17 +178,8 @@ export function oplPipelineV2Core(cv, frameBgr, params = {}, outStats = null) {
 
   // rgb_to_luminance
   const luminance = rgbToLuminance(cv, frameBgr);
-
-  // scotopic_light_level_check
-  const meanLum = meanLuminance(cv, luminance);
-  const dim = isDimFrame(meanLum);
-
-  // rod_convergence_pooling_before_log_transform
-  const luminanceForLog = dim ? rodPooling(cv, luminance) : luminance;
-
   // log_transform
-  const luminanceLog = logTransform(cv, luminanceForLog);
-  if (dim) luminanceForLog.delete();
+  const luminanceLog = logTransform(cv, luminance);
   luminance.delete();
 
   // specular_mask_and_suppression
@@ -254,20 +192,10 @@ export function oplPipelineV2Core(cv, frameBgr, params = {}, outStats = null) {
   const onRaw = rectifyOn(cv, dog);
   const offRaw = rectifyOff(cv, dog);
 
-  // noise_adaptive_dog_threshold_via_mad
-  // a threshold can only reject noise it can measure - it can't recover an edge the camera itself never captured sharply (focus/compression/motion blur)
-  const noiseSigma = estimateNoiseSigma(dog);
-  const adaptiveDogThreshold = Math.max(dogThreshold, DOG_NOISE_MAD_MULTIPLIER * noiseSigma);
-
   // contour_area_filter
-  const contourMask = filterByContourArea(cv, dog, adaptiveDogThreshold, minContourArea);
+  const contourMask = filterByContourArea(cv, dog, dogThreshold, minContourArea);
   dog.delete();
 
-  if (outStats) {
-    outStats.meanLuminance = meanLum;
-    outStats.isDim = dim;
-    outStats.dogThreshold = adaptiveDogThreshold;
-  }
   const maskFloat = new cv.Mat();
   contourMask.convertTo(maskFloat, onRaw.type(), 1 / 255, 0);
   contourMask.delete();

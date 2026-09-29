@@ -73,7 +73,6 @@ import {
   FPSMeter,
   exposureToAlpha,
   computeSigmas,
-  scotopicTau,
   getTrackCapabilities,
   applyNormalisedConstraint,
 } from './live_feed/opl_engine.js';
@@ -222,10 +221,9 @@ function processFrame() {
     sigmaCValue.textContent = sigmaC.toFixed(2);
     sigmaSValue.textContent = sigmaS.toFixed(2);
 
-    const stats = {};
-    composite = oplPipelineV2Core(cv, frameBgr, { sigmaC, sigmaS }, stats);
+    composite = oplPipelineV2Core(cv, frameBgr, { sigmaC, sigmaS });
 
-    const tau = scotopicTau(parseFloat(tauSlider.value), stats.meanLuminance);
+    const tau = parseFloat(tauSlider.value);
     const dt = prevTime === null ? 1 / 30 : (now - prevTime) / 1000;
     const alpha = exposureToAlpha(dt, tau);
     prevTime = now;
